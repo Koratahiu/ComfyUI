@@ -243,17 +243,20 @@ class SDClipModel(torch.nn.Module, ClipTokenWeightEncoder):
             tokens_embed = self.transformer.get_input_embeddings()(tokens_embed, out_dtype=torch.float32)
             index = 0
             pad_extra = 0
+            embeds_info = []
             for o in other_embeds:
                 emb = o[1]
                 if torch.is_tensor(emb):
                     emb = {"type": "embedding", "data": emb}
 
                 extra = None
+                extra = None
                 emb_type = emb.get("type", None)
                 if emb_type == "embedding":
                     emb = emb.get("data", None)
                 else:
                     if hasattr(self.transformer, "preprocess_embed"):
+                        emb, extra = self.transformer.preprocess_embed(emb, device=device)
                         emb, extra = self.transformer.preprocess_embed(emb, device=device)
                     else:
                         emb = None
@@ -277,6 +280,7 @@ class SDClipModel(torch.nn.Module, ClipTokenWeightEncoder):
                     tokens_embed = torch.cat([tokens_embed[:, :ind], emb, tokens_embed[:, ind:]], dim=1)
                     attention_mask = attention_mask[:ind] + [1] * emb_shape + attention_mask[ind:]
                     index += emb_shape - 1
+                    embeds_info.append({"type": emb_type, "index": ind, "size": emb_shape, "extra": extra})
                     embeds_info.append({"type": emb_type, "index": ind, "size": emb_shape, "extra": extra})
                 else:
                     index += -1
@@ -607,6 +611,10 @@ class SDTokenizer:
         min_padding = tokenizer_options.get("{}_min_padding".format(self.embedding_key), self.min_padding)
 
         text = escape_important(text)
+        if kwargs.get("disable_weights", False):
+            parsed_weights = [(text, 1.0)]
+        else:
+            parsed_weights = token_weights(text, 1.0)
         if kwargs.get("disable_weights", False):
             parsed_weights = [(text, 1.0)]
         else:
