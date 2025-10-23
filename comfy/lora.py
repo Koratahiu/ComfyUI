@@ -33,6 +33,110 @@ LORA_CLIP_MAP = {
     "self_attn.out_proj": "self_attn_out_proj",
 }
 
+def _oft_pytorch_skew_symmetric(vec: torch.Tensor, block_size: int):
+    """Create a skew-symmetric matrix from a vector."""
+    rows, cols = torch.triu_indices(block_size, block_size, 1, device=vec.device)
+    matrix = torch.zeros((vec.shape[0], block_size, block_size), device=vec.device, dtype=vec.dtype)
+    matrix[:, rows, cols] = vec
+    return matrix - matrix.transpose(-2, -1)
+
+def _oft_cayley_batch(Q_skew: torch.Tensor) -> torch.Tensor:
+    """Perform the Cayley parametrization on a batch of skew-symmetric matrices."""
+    block_size = Q_skew.shape[-1]
+    id_mat = torch.eye(block_size, device=Q_skew.device, dtype=Q_skew.dtype).unsqueeze(0)
+    # R = (I - Q_skew) @ (I + Q_skew)^-1. We use linalg.solve for precision and stability.
+    return torch.linalg.solve(id_mat + Q_skew, id_mat - Q_skew, left=False)
+
+def _oft_block_diagonal(blocks: torch.Tensor) -> torch.Tensor:
+    """Create a block-diagonal matrix from a batch of blocks."""
+    return torch.block_diag(*[b for b in blocks])
+
+
+class OFTAdapter(weight_adapter.WeightAdapterBase):
+    def __init__(self, name, oft_tensor, device, dtype):
+        self.name = name
+        self.device = device
+        self.dtype = dtype
+        self.oft_tensor = comfy.model_management.cast_to_device(oft_tensor, device, torch.float32, copy=True)
+        self.rotation_matrix = None
+
+    @classmethod
+    def load(cls, lora_key, lora, alpha, dora_scale, loaded_keys):
+        oft_weight_name = f"{lora_key}.oft_R.weight"
+        if oft_weight_name in lora:
+            adapter = cls(lora_key, lora[oft_weight_name], lora[oft_weight_name].device, lora[oft_weight_name].dtype)
+            adapter.loaded_keys = {oft_weight_name}
+            if alpha is not None:
+                adapter.alpha = alpha
+            return adapter
+        return None
+
+    def calculate_weight(self, weight, key, strength, strength_model, offset, function, intermediate_dtype, original_weights):
+        if self.rotation_matrix is None:
+            try:
+                # Determine dimensions from the target weight
+                # For Linear layers, weight shape is [out_features, in_features]
+                # For Conv2D layers, weight shape is [out_channels, in_channels, kernel_h, kernel_w]
+                if weight.dim() == 2:
+                    in_features = weight.shape[1]
+                elif weight.dim() == 4:
+                    in_features = weight.shape[1] * weight.shape[2] * weight.shape[3]
+                else:
+                    logging.warning(f"OFT is not supported for weight shape {weight.shape} in key {key}. Skipping.")
+                    return None
+
+                r = self.oft_tensor.shape[0] # Number of blocks
+
+                if in_features % r != 0:
+                    logging.error(f"OFT Error: in_features ({in_features}) must be divisible by r ({r}) for key {key}. Skipping.")
+                    self.rotation_matrix = torch.tensor([]) # Mark as failed
+                    return None
+
+                block_size = in_features // r
+                expected_n_elements = block_size * (block_size - 1) // 2
+
+                if self.oft_tensor.shape[1] != expected_n_elements:
+                    logging.error(f"OFT Error: Tensor shape mismatch for key {key}. "
+                                  f"Expected {expected_n_elements} elements per block, but got {self.oft_tensor.shape[1]}. Skipping.")
+                    self.rotation_matrix = torch.tensor([]) # Mark as failed
+                    return None
+
+                # Create the full rotation matrix
+                skew_symmetric_blocks = _oft_pytorch_skew_symmetric(self.oft_tensor, block_size)
+                orthogonal_blocks = _oft_cayley_batch(skew_symmetric_blocks)
+                self.rotation_matrix = _oft_block_diagonal(orthogonal_blocks).to(dtype=intermediate_dtype, device=self.device)
+
+            except Exception as e:
+                logging.error(f"Failed to create OFT rotation matrix for key {key}: {e}")
+                self.rotation_matrix = torch.tensor([]) # Mark as failed
+                return None
+
+        if self.rotation_matrix.numel() == 0: # Check for sentinel value
+            return None
+
+        original_dtype = weight.dtype
+        original_shape = weight.shape
+        weight_fp32 = comfy.model_management.cast_to_device(weight, self.device, intermediate_dtype)
+
+        # Reshape weight to 2D if it's not already
+        if weight_fp32.dim() == 4:
+            weight_fp32 = weight_fp32.view(original_shape[0], -1)
+
+        # The new weight W' = W @ R.T, where R is the orthogonal rotation matrix.
+        # This is equivalent to (R @ W.T).T
+        rotated_weight = torch.matmul(self.rotation_matrix, weight_fp32.T).T
+        diff = rotated_weight - weight_fp32
+
+        if strength != 0.0:
+            weight_fp32 += function(strength * diff)
+
+        # Reshape back to original shape and cast to original dtype
+        return weight_fp32.view(original_shape).to(original_dtype)
+
+# Register the OFT adapter to be checked first, so it's prioritized over standard LoRA.
+weight_adapter.adapters.insert(0, OFTAdapter)
+
+# END OF OFT IMPLEMENTATION
 
 def load_lora(lora, to_load, log_missing=True):
     patch_dict = {}
@@ -50,12 +154,16 @@ def load_lora(lora, to_load, log_missing=True):
             dora_scale = lora[dora_scale_name]
             loaded_keys.add(dora_scale_name)
 
+        # This loop will now check for OFTAdapter first
         for adapter_cls in weight_adapter.adapters:
             adapter = adapter_cls.load(x, lora, alpha, dora_scale, loaded_keys)
             if adapter is not None:
                 patch_dict[to_load[x]] = adapter
                 loaded_keys.update(adapter.loaded_keys)
-                continue
+                break # Use the first adapter that matches
+
+        if to_load[x] in patch_dict:
+            continue
 
         w_norm_name = "{}.w_norm".format(x)
         b_norm_name = "{}.b_norm".format(x)
