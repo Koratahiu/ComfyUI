@@ -20,7 +20,7 @@ import comfy.context_windows
 import comfy.utils
 import scipy.stats
 import numpy
-
+import comfy.k_diffusion.sampling
 
 def add_area_dims(area, num_dims):
     while (len(area) // 2) < num_dims:
@@ -724,7 +724,7 @@ KSAMPLER_NAMES = ["euler", "euler_cfg_pp", "euler_ancestral", "euler_ancestral_c
                   "lms", "dpm_fast", "dpm_adaptive", "dpmpp_2s_ancestral", "dpmpp_2s_ancestral_cfg_pp", "dpmpp_sde", "dpmpp_sde_gpu",
                   "dpmpp_2m", "dpmpp_2m_cfg_pp", "dpmpp_2m_sde", "dpmpp_2m_sde_gpu", "dpmpp_2m_sde_heun", "dpmpp_2m_sde_heun_gpu", "dpmpp_3m_sde", "dpmpp_3m_sde_gpu", "ddpm", "lcm",
                   "ipndm", "ipndm_v", "deis", "res_multistep", "res_multistep_cfg_pp", "res_multistep_ancestral", "res_multistep_ancestral_cfg_pp",
-                  "gradient_estimation", "gradient_estimation_cfg_pp", "er_sde", "seeds_2", "seeds_3", "sa_solver", "sa_solver_pece"]
+                  "gradient_estimation", "gradient_estimation_cfg_pp", "er_sde", "seeds_2", "seeds_3", "sa_solver", "sa_solver_pece", "diff2flow_euler"]
 
 class KSAMPLER(Sampler):
     def __init__(self, sampler_function, extra_options={}, inpaint_options={}):
@@ -1083,6 +1083,9 @@ def sampler_object(name):
         sampler = KSAMPLER(uni_pc.sample_unipc_bh2)
     elif name == "ddim":
         sampler = ksampler("euler", inpaint_options={"random": True})
+    # Add this new case
+    elif name == "diff2flow_euler":
+        sampler = KSAMPLER(comfy.k_diffusion.sampling.sample_diff2flow_euler)
     else:
         sampler = ksampler(name)
     return sampler

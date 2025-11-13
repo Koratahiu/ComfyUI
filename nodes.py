@@ -2296,6 +2296,7 @@ async def init_builtin_extra_nodes():
         "nodes_controlnet.py",
         "nodes_hunyuan.py",
         "nodes_eps.py",
+        "generalized_offset_noise.py",
         "nodes_flux.py",
         "nodes_lora_extract.py",
         "nodes_torch_compile.py",

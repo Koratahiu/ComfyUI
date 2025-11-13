@@ -12,6 +12,7 @@ from . import deis
 from . import sa_solver
 import comfy.model_patcher
 import comfy.model_sampling
+import comfy.samplers
 
 def append_zero(x):
     return torch.cat([x, x.new_zeros([1])])
@@ -1784,3 +1785,71 @@ def sample_sa_solver(model, x, sigmas, extra_args=None, callback=None, disable=F
 def sample_sa_solver_pece(model, x, sigmas, extra_args=None, callback=None, disable=False, tau_func=None, s_noise=1.0, noise_sampler=None, predictor_order=3, corrector_order=4, simple_order_2=False):
     """Stochastic Adams Solver with PECE (Predict–Evaluate–Correct–Evaluate) mode (NeurIPS 2023)."""
     return sample_sa_solver(model, x, sigmas, extra_args=extra_args, callback=callback, disable=disable, tau_func=tau_func, s_noise=s_noise, noise_sampler=noise_sampler, predictor_order=predictor_order, corrector_order=corrector_order, use_pece=True, simple_order_2=simple_order_2)
+
+@torch.no_grad()
+def sample_diff2flow_euler(model, x, sigmas, extra_args=None, callback=None, disable=None):
+    """
+    Euler ODE solver for Diff2Flow models.
+    """
+    extra_args = {} if extra_args is None else extra_args
+    base_model = model.inner_model.inner_model
+    if not hasattr(base_model, 'get_diff2flow_velocity'):
+        raise AttributeError("Model is not enabled for Diff2Flow. Please use the 'Enable Diff2Flow' node first.")
+
+    cond_scale = model.inner_model.cfg
+    positive_conds = model.inner_model.conds.get("positive")
+    negative_conds = model.inner_model.conds.get("negative")
+    model_options = extra_args.get('model_options', {})
+
+    steps = len(sigmas) - 1
+    if steps < 1:
+        return x
+
+    # Un-scale the initial noise.
+    # Flow Matching's ODE must start from unscaled N(0,I) noise, but KSampler prepares x as scaled noise.
+    initial_sigma = sigmas[0]
+    if initial_sigma > 0:
+        latent = x / initial_sigma
+    else:
+        latent = x
+
+    # The ODE is solved over a continuous time t in [0, 1].
+    timesteps = torch.linspace(0.0, 1.0 - (1.0 / steps), steps, device=x.device)
+    dt = 1.0 / steps
+
+    original_apply_model = base_model.apply_model
+    try:
+        pbar = trange(steps, disable=disable)
+        for i in pbar:
+            t_current = timesteps[i].unsqueeze(0)
+
+            # The monkey-patched apply_model now directly passes conditioning through.
+            # This is simpler and more robust than trying to reconstruct kwargs.
+            def diff2flow_apply_model(x_in, sigma_in, **c):
+                # The 'sigma_in' from calc_cond_batch is ignored because our noise level
+                # is determined by the flow time 't_current'.
+                fm_t = t_current.repeat(x_in.shape[0])
+                # The 'c' dict has everything needed: c_crossattn, y, control, etc.
+                return base_model.get_diff2flow_velocity(fm_x=x_in, fm_t=fm_t, **c)
+
+            base_model.apply_model = diff2flow_apply_model
+            
+            # calc_cond_batch needs a sigma that corresponds to the flow time 't'.
+            # We convert our flow time 't' into the equivalent diffusion model timestep, and then into a sigma.
+            # This ensures any conditioning schedules (e.g., ADetailer) work correctly.
+            dm_t_continuous = base_model._df_convert_fm_t_to_dm_t(t_current.repeat(latent.shape[0]))
+            current_sigma_for_conds = base_model.model_sampling.sigma(dm_t_continuous)
+
+            velocity_cond, velocity_uncond = comfy.samplers.calc_cond_batch(base_model, [positive_conds, negative_conds], latent, current_sigma_for_conds, model_options)
+
+            velocity = velocity_uncond + cond_scale * (velocity_cond - velocity_uncond)
+
+            latent = latent + velocity * dt
+            
+            if callback is not None:
+                callback({'x': latent, 'i': i, 'sigma': sigmas[i], 'sigma_hat': sigmas[i], 'denoised': latent})
+    finally:
+        # Restore the original model function to avoid side effects.
+        base_model.apply_model = original_apply_model
+
+    return latent

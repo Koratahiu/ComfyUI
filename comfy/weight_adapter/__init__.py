@@ -5,7 +5,7 @@ from .lokr import LoKrAdapter
 from .glora import GLoRAAdapter
 from .oft import OFTAdapter
 from .boft import BOFTAdapter
-
+from .oftv2 import OFTv2Adapter
 
 adapters: list[type[WeightAdapterBase]] = [
     LoRAAdapter,
@@ -13,6 +13,7 @@ adapters: list[type[WeightAdapterBase]] = [
     LoKrAdapter,
     GLoRAAdapter,
     OFTAdapter,
+    OFTv2Adapter,
     BOFTAdapter,
 ]
 adapter_maps: dict[str, type[WeightAdapterBase]] = {
@@ -20,6 +21,7 @@ adapter_maps: dict[str, type[WeightAdapterBase]] = {
     "LoHa": LoHaAdapter,
     "LoKr": LoKrAdapter,
     "OFT": OFTAdapter,
+    "OFTv2": OFTv2Adapter,
     ## We disable not implemented algo for now
     # "GLoRA": GLoRAAdapter,
     # "BOFT": BOFTAdapter,
